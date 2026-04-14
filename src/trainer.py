@@ -8,6 +8,13 @@ from src.evaluation.evaluate import evaluate
 from src.utils.decode import mvdet_decode
 from src.utils.nms import nms
 from src.models.aggregation import aggregate_feat
+from src.utils.comm_channel import BasicCommChannel
+
+from src.loss import focal_loss, regL1loss
+from src.evaluation.evaluate import evaluate
+from src.utils.decode import mvdet_decode
+from src.utils.nms import nms
+from src.models.aggregation import aggregate_feat
 
 
 class PerspectiveTrainer(object):
@@ -15,6 +22,15 @@ class PerspectiveTrainer(object):
         self.model = model
         self.args = args
         self.logdir = logdir
+
+        self.comm_channel = BasicCommChannel(
+            budget_mb=args.comm_budget_mb,
+            delay_ms=args.comm_delay_ms,
+            drop_prob=args.comm_drop_prob,
+            slot_ms=args.slot_ms,
+            bits_per_value=args.comm_bits_per_value,
+            budget_policy=args.comm_budget_policy,
+        )
 
     def train(self, epoch, dataloader, optimizer, scheduler=None, log_interval=100):
         self.model.train()
@@ -33,10 +49,22 @@ class PerspectiveTrainer(object):
             imgs = imgs.cuda()
             affine_mats = affine_mats.cuda()
 
+            # feat, (imgs_heatmap, imgs_offset, imgs_wh) = self.model.get_feat(
+            #     imgs, affine_mats, self.args.down
+            # )
+            # overall_feat = aggregate_feat(feat, keep_cams, self.model.aggregation)
+            # world_heatmap, world_offset = self.model.get_output(overall_feat)
+
             feat, (imgs_heatmap, imgs_offset, imgs_wh) = self.model.get_feat(
                 imgs, affine_mats, self.args.down
             )
-            overall_feat = aggregate_feat(feat, keep_cams, self.model.aggregation)
+
+            # apply communication model on per-view features
+            recv_feat, recv_mask, comm_stats = self.comm_channel.apply(
+                feat, keep_cams=keep_cams, frame_ids=frame
+            )
+
+            overall_feat = aggregate_feat(recv_feat, recv_mask, self.model.aggregation)
             world_heatmap, world_offset = self.model.get_output(overall_feat)
 
             loss_w_hm = focal_loss(world_heatmap, world_gt['heatmap'])
@@ -76,6 +104,9 @@ class PerspectiveTrainer(object):
                 print(
                     f'Train epoch: {epoch}, batch:{batch_idx + 1}, '
                     f'loss: {losses / (batch_idx + 1):.3f}, time: {t1 - t0:.1f}'
+                    f'comm_mb: {comm_stats["realized_comm_mb"]:.3f}, '
+                    f'eff_ratio: {comm_stats["effective_ratio"]:.3f}, '
+                    f'delay_slots: {comm_stats["delay_slots"]}'
                 )
 
         return losses / len(dataloader), None
@@ -94,9 +125,20 @@ class PerspectiveTrainer(object):
                 imgs = imgs.cuda()
                 affine_mats = affine_mats.cuda()
 
-                (world_heatmap, world_offset), _ = self.model(
-                    imgs, affine_mats, self.args.down, keep_cams=keep_cams
+                # (world_heatmap, world_offset), _ = self.model(
+                #     imgs, affine_mats, self.args.down, keep_cams=keep_cams
+                # )
+
+                feat, _ = self.model.get_feat(
+                    imgs, affine_mats, self.args.down
                 )
+
+                recv_feat, recv_mask, comm_stats = self.comm_channel.apply(
+                    feat, keep_cams=keep_cams, frame_ids=frame
+                )
+
+                overall_feat = aggregate_feat(recv_feat, recv_mask, self.model.aggregation)
+                world_heatmap, world_offset = self.model.get_output(overall_feat)
 
                 loss = focal_loss(world_heatmap, world_gt['heatmap'])
                 if self.args.use_mse:
@@ -140,6 +182,9 @@ class PerspectiveTrainer(object):
             f'moda: {moda:.1f}%, modp: {modp:.1f}%, '
             f'prec: {precision:.1f}%, recall: {recall:.1f}%, '
             f'f1: {f1:.1f}%, time: {time.time() - t0:.1f}s'
+            f'comm_mb: {comm_stats["realized_comm_mb"]:.3f}, '
+            f'eff_ratio: {comm_stats["effective_ratio"]:.3f}, '
+            f'delay_slots: {comm_stats["delay_slots"]}'
         )
 
         return losses / len(dataloader), [moda, modp, precision, recall, f1]
