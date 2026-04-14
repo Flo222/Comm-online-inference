@@ -444,5 +444,19 @@ if __name__ == '__main__':
     parser.add_argument('--img_reduce', type=int, default=12)
     parser.add_argument('--img_kernel_size', type=int, default=10)
 
+    parser.add_argument('--comm_budget_mb', type=float, default=1.0)
+    parser.add_argument('--comm_delay_ms', type=int, default=0)
+    parser.add_argument('--comm_drop_prob', type=float, default=0.0)
+
+    # 先把 1 slot 定义成 100 ms，方便和论文对齐
+    parser.add_argument('--slot_ms', type=int, default=100)
+
+    # 估算消息大小时先统一按 fp16 记账
+    parser.add_argument('--comm_bits_per_value', type=int, default=16)
+
+    # 预算不够时的最简单策略
+    parser.add_argument('--comm_budget_policy', type=str, default='prefix',
+                        choices=['prefix', 'random'])
+
     args = parser.parse_args()
     main(args)
