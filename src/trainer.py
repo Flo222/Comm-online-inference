@@ -184,6 +184,7 @@ class PerspectiveTrainer(object):
             f'f1: {f1:.1f}%, time: {time.time() - t0:.1f}s'
             f'comm_mb: {comm_stats["realized_comm_mb"]:.3f}, '
             f'eff_ratio: {comm_stats["effective_ratio"]:.3f}, '
+            f'msg_mb_per_cam: {comm_stats["msg_size_mb_per_cam"]:.3f}, '
             f'delay_slots: {comm_stats["delay_slots"]}'
         )
 

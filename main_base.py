@@ -444,7 +444,7 @@ if __name__ == '__main__':
     parser.add_argument('--img_reduce', type=int, default=12)
     parser.add_argument('--img_kernel_size', type=int, default=10)
 
-    parser.add_argument('--comm_budget_mb', type=float, default=1.0)
+    parser.add_argument('--comm_budget_mb', type=float, default=128.0)
     parser.add_argument('--comm_delay_ms', type=int, default=0)
     parser.add_argument('--comm_drop_prob', type=float, default=0.0)
 
@@ -457,6 +457,21 @@ if __name__ == '__main__':
     # 预算不够时的最简单策略
     parser.add_argument('--comm_budget_policy', type=str, default='prefix',
                         choices=['prefix', 'random'])
+    
+    parser.add_argument('--comm_topology', type=str, default='all_to_server',
+                        choices=[
+                            'all_to_server',
+                            'fully_connected',
+                            'ring',
+                            'chain',
+                            'custom'
+                        ])
+
+    parser.add_argument('--comm_self_loop', type=bool, default=False)
+    parser.add_argument('--comm_bidirectional', type=bool, default=True)
+
+    # custom topology 用，例如 "node_0->node_1,node_1->node_2,node_2->server"
+    parser.add_argument('--comm_edges', type=str, default='')
 
     args = parser.parse_args()
     main(args)
