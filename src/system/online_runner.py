@@ -372,10 +372,10 @@ class OnlineRunner:
 
             comm_stats = self.comm_manager.get_slot_stats()
 
-            metrics["num_agent_outputs"] = len(agent_outputs)
             metrics = {
                 "slot_loss": float(loss.item()),
                 "updated": 1,
+                "num_agent_outputs": len(agent_outputs),
             }
             self.logger.log_slot(slot_id, metrics, decision, comm_stats)
 

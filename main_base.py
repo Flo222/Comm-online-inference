@@ -149,7 +149,7 @@ def build_logdir(args, is_debug):
                 f'logs/{args.dataset}/'
                 f'{"DEBUG_" if is_debug else ""}'
                 f'ONLINE_{args.online_mode}_{args.arch}_{args.aggregation}_'
-                f'maxslots{args.max_slots}_'
+                f'inferslots{args.online_infer_slots}_'
                 f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
             )
     else:
