@@ -542,7 +542,7 @@ class OnlineRunner:
         if self.args.online_mode == "train":
             return self.run_train(max_slots=self.args.max_slots)
         elif self.args.online_mode == "infer":
-            return self.run_infer(max_slots=self.args.max_slots)
+            return self.run_infer(max_slots=self.args.online_infer_slots)
         elif self.args.online_mode == "train_then_infer":
             return self.run_train_then_infer(
                 train_slots=self.args.online_train_slots,
