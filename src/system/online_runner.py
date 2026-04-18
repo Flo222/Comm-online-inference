@@ -88,13 +88,13 @@ class OnlineRunner:
         self.comm_manager = CommManager(channel=channel)
 
         # Be robust to either old or new DecisionPolicy signature
-        try:
-            self.decision_policy = DecisionPolicy(
-                mode=getattr(args, "comm_graph", "all_to_server"),
-                max_active=getattr(args, "max_active_senders", None),
-            )
-        except TypeError:
-            self.decision_policy = DecisionPolicy(mode="all_active")
+        # try:
+        #     self.decision_policy = DecisionPolicy(
+        #         mode=getattr(args, "comm_graph", "all_to_server"),
+        #         max_active=getattr(args, "max_active_senders", None),
+        #     )
+        # except TypeError:
+        #     self.decision_policy = DecisionPolicy(mode="all_active")
 
         self.logger = OnlineLogger(logdir=logdir)
 
@@ -208,38 +208,22 @@ class OnlineRunner:
         return decision, set(active_nodes)
 
     def _forward_and_loss_collab(self, dataset, imgs, affine_mats, keep_cams, world_gt, imgs_gt, slot_id):
-        """
-        Stable collaborative inference/training:
-        1) Run original baseline feature extraction ONCE
-        2) Treat feat_all[:, i] as node i's local world feature
-        3) Send these local features through CommManager + ChannelModel
-        4) Fuse only delivered world features at server
-        5) Run original detection head on fused world feature
-        """
         B, N = imgs.shape[:2]
         imgs_gt = self._prepare_imgs_gt_for_loss(imgs_gt)
 
-        # original multi-view feature extraction
+        # 1) 原始多视角 backbone 只跑一次
         feat_all, (imgs_heatmap, imgs_offset, imgs_wh) = self.model.get_feat(
             imgs, affine_mats, self.args.down
         )
         # feat_all: [B, N, C, H, W]
 
-        # set local features
+        # 2) 每个 node 保存自己的本地 world_feat
         for i, node in enumerate(self.nodes):
             node.set_local_world_feat(feat_all[:, i])
 
         node_map = {node.node_id: node for node in self.nodes}
 
-        # send messages through CommManager + ChannelModel
-        # for sender_id, receiver_id in self.current_edges:
-        #     msg = node_map[sender_id].build_message(
-        #         receiver=receiver_id,
-        #         msg_type="world_feat",
-        #     )
-        #     self.comm_manager.send(msg)
-        node_map = {node.node_id: node for node in self.nodes}
-
+        # 3) 按当前边集发送消息
         for sender_id, receiver_id in self.current_edges:
             msg = node_map[sender_id].build_message(
                 receiver=receiver_id,
@@ -247,37 +231,53 @@ class OnlineRunner:
             )
             self.comm_manager.send(msg)
 
-        # collect messages that arrived at server in this slot
-        server_msgs = self.comm_manager.collect_for("server")
+        # 4) 每个 agent 单独收消息 -> 单独融合 -> 单独输出
+        agent_outputs = {}
+        agent_losses = []
 
-        B, N = feat_all.shape[:2]
-        recv_feat = torch.zeros_like(feat_all)
-        recv_mask = torch.zeros((B, N), dtype=torch.bool, device=feat_all.device)
+        for receiver_id in self.node_ids:
+            recv_msgs = self.comm_manager.collect_for(receiver_id)
 
-        for msg in server_msgs:
-            wf = msg.payload.get("world_feat", None)
-            cam_id = msg.payload.get("cam_id", None)
-            if wf is None or cam_id is None:
-                continue
-            recv_feat[:, cam_id] = wf
-            recv_mask[:, cam_id] = True
+            # 先把自己的本地特征放进去
+            feat_list = [node_map[receiver_id].local_world_feat]
 
-        overall_feat = aggregate_feat(recv_feat, recv_mask, self.model.aggregation)
-        world_heatmap, world_offset = self.model.get_output(overall_feat)
+            # 再加收到的其他人特征
+            recv_from = []
+            for msg in recv_msgs:
+                wf = msg.payload.get("world_feat", None)
+                sender = msg.payload.get("node_id", None)
+                if wf is None:
+                    continue
 
-        baseline_feat = aggregate_feat(feat_all, keep_cams, self.model.aggregation)
-        diff = (baseline_feat - overall_feat).abs().max().item()
+                # 若消息经过 fp16 压缩，转回本地 dtype
+                wf = wf.to(feat_all.dtype)
 
-        if slot_id == 0:
-            print(f"[DEBUG] recv_mask sum: {recv_mask.sum().item()}")
-            print(f"[DEBUG] max abs diff baseline vs comm agg: {diff:.8f}")
+                # 避免 self_loop=True 时把自己重复加两次
+                if sender == receiver_id:
+                    continue
 
-        # keep original loss structure
-        loss_w_hm = focal_loss(world_heatmap, world_gt["heatmap"])
-        loss_w_off = regL1loss(
-            world_offset, world_gt["reg_mask"], world_gt["idx"], world_gt["offset"]
-        )
+                feat_list.append(wf)
+                recv_from.append(sender)
 
+            fused_feat = self._fuse_world_features(feat_list)
+            world_heatmap_i, world_offset_i = self.model.get_output(fused_feat)
+
+            # 记录
+            agent_outputs[receiver_id] = {
+                "fused_feat": fused_feat,
+                "world_heatmap": world_heatmap_i,
+                "world_offset": world_offset_i,
+                "recv_from": recv_from,
+            }
+
+            # 每个 agent 各算一份 world loss
+            loss_w_hm_i = focal_loss(world_heatmap_i, world_gt["heatmap"])
+            loss_w_off_i = regL1loss(
+                world_offset_i, world_gt["reg_mask"], world_gt["idx"], world_gt["offset"]
+            )
+            agent_losses.append(loss_w_hm_i + loss_w_off_i)
+
+        # 5) image 辅助损失保留原来的共享写法
         loss_img_hm = focal_loss(
             imgs_heatmap,
             imgs_gt["heatmap"],
@@ -290,23 +290,25 @@ class OnlineRunner:
             imgs_wh, imgs_gt["reg_mask"], imgs_gt["idx"], imgs_gt["wh"]
         )
 
-        w_loss = loss_w_hm + loss_w_off
+        world_loss = torch.stack(agent_losses).mean()
         img_loss = loss_img_hm + loss_img_off + loss_img_wh * 0.1
-        loss = w_loss + img_loss / N * self.args.alpha
+        loss = world_loss + img_loss / N * self.args.alpha
 
         if self.args.use_mse:
-            loss = (
-                torch.nn.functional.mse_loss(
-                    world_heatmap, world_gt["heatmap"].to(world_heatmap.device)
+            mse_losses = []
+            for receiver_id in self.node_ids:
+                world_heatmap_i = agent_outputs[receiver_id]["world_heatmap"]
+                mse_losses.append(
+                    torch.nn.functional.mse_loss(
+                        world_heatmap_i, world_gt["heatmap"].to(world_heatmap_i.device)
+                    )
                 )
-                + self.args.alpha
-                * torch.nn.functional.mse_loss(
+            loss = torch.stack(mse_losses).mean() + \
+                self.args.alpha * torch.nn.functional.mse_loss(
                     imgs_heatmap, imgs_gt["heatmap"].to(imgs_heatmap.device)
-                )
-                / N
-            )
+                ) / N
 
-        return loss, world_heatmap, world_offset
+        return loss, agent_outputs
 
     def _decode_and_collect(self, dataset, world_heatmap, world_offset, frame, res_list):
         xys = mvdet_decode(
@@ -353,7 +355,11 @@ class OnlineRunner:
             imgs = imgs.cuda()
             affine_mats = affine_mats.cuda()
 
-            loss, world_heatmap, world_offset = self._forward_and_loss_collab(
+            # loss, world_heatmap, world_offset = self._forward_and_loss_collab(
+            #     self.train_dataset, imgs, affine_mats, keep_cams, world_gt, imgs_gt, slot_id
+            # )
+
+            loss, agent_outputs = self._forward_and_loss_collab(
                 self.train_dataset, imgs, affine_mats, keep_cams, world_gt, imgs_gt, slot_id
             )
 
@@ -366,6 +372,7 @@ class OnlineRunner:
 
             comm_stats = self.comm_manager.get_slot_stats()
 
+            metrics["num_agent_outputs"] = len(agent_outputs)
             metrics = {
                 "slot_loss": float(loss.item()),
                 "updated": 1,
@@ -402,7 +409,8 @@ class OnlineRunner:
 
     def run_infer(self, max_slots=None):
         self.model.eval()
-        res_list = []
+
+        res_dict = {node_id: [] for node_id in self.node_ids}
         losses = 0.0
         num_steps = 0
 
@@ -413,25 +421,32 @@ class OnlineRunner:
 
                 slot_id = slot_sample["slot_id"]
                 decision, active_nodes = self._slot_comm_and_nodes(slot_sample)
-
                 imgs, affine_mats, keep_cams, world_gt, imgs_gt, frame = self._normalize_slot_tensors(slot_sample)
+
                 imgs = imgs.cuda()
                 affine_mats = affine_mats.cuda()
 
-                loss, world_heatmap, world_offset = self._forward_and_loss_collab(
+                loss, agent_outputs = self._forward_and_loss_collab(
                     self.test_dataset, imgs, affine_mats, keep_cams, world_gt, imgs_gt, slot_id
                 )
 
                 losses += loss.item()
                 num_steps += 1
 
-                self._decode_and_collect(self.test_dataset, world_heatmap, world_offset, frame, res_list)
+                for node_id, out in agent_outputs.items():
+                    self._decode_and_collect(
+                        self.test_dataset,
+                        out["world_heatmap"],
+                        out["world_offset"],
+                        frame,
+                        res_dict[node_id],
+                    )
 
                 comm_stats = self.comm_manager.get_slot_stats()
-
                 metrics = {
                     "slot_loss": float(loss.item()),
                     "updated": 0,
+                    "num_agent_outputs": len(agent_outputs),
                 }
                 self.logger.log_slot(slot_id, metrics, decision, comm_stats)
 
@@ -446,45 +461,64 @@ class OnlineRunner:
                     f"loss={loss.item():.6f}"
                 )
 
-        res = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
-        np.savetxt(os.path.join(self.logdir, "online_test.txt"), res, "%d")
+        agent_metrics = {}
+        for node_id, res_list in res_dict.items():
+            res = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
+            out_path = os.path.join(self.logdir, f"online_test_{node_id}.txt")
+            np.savetxt(out_path, res, "%d")
 
-        moda, modp, precision, recall = evaluate(
-            os.path.join(self.logdir, "online_test.txt"),
-            f"{self.test_dataset.gt_fname}.txt",
-            self.test_dataset.base.__name__,
-            self.test_dataset.frames,
-        )
-        f1 = 2.0 * precision * recall / (precision + recall + 1e-12)
+            moda, modp, precision, recall = evaluate(
+                out_path,
+                f"{self.test_dataset.gt_fname}.txt",
+                self.test_dataset.base.__name__,
+                self.test_dataset.frames,
+            )
+            f1 = 2.0 * precision * recall / (precision + recall + 1e-12)
+
+            agent_metrics[node_id] = {
+                "moda": moda,
+                "modp": modp,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+            }
 
         self.logger.save_csv("online_infer_log.csv")
         summary = self.logger.summarize()
         avg_loss = losses / max(1, num_steps)
 
-        avg_comm_cost = summary.get("avg_comm_cost", summary.get("avg_comm_cost_mb", 0.0))
-        avg_num_messages = summary.get("avg_num_messages", 0.0)
+        avg_moda = np.mean([m["moda"] for m in agent_metrics.values()])
+        avg_modp = np.mean([m["modp"] for m in agent_metrics.values()])
+        avg_precision = np.mean([m["precision"] for m in agent_metrics.values()])
+        avg_recall = np.mean([m["recall"] for m in agent_metrics.values()])
+        avg_f1 = np.mean([m["f1"] for m in agent_metrics.values()])
 
-        print("========== COLLAB INFER SUMMARY ==========")
-        print(f"num_slots: {summary.get('num_slots', num_steps)}")
+        print("========== MULTI-AGENT INFER SUMMARY ==========")
+        for node_id, m in agent_metrics.items():
+            print(
+                f"{node_id}: "
+                f"moda={m['moda']:.1f}% "
+                f"modp={m['modp']:.1f}% "
+                f"prec={m['precision']:.1f}% "
+                f"recall={m['recall']:.1f}% "
+                f"f1={m['f1']:.1f}%"
+            )
+        print("----------------------------------------------")
+        print(f"avg_agent_moda: {avg_moda:.1f}%")
+        print(f"avg_agent_modp: {avg_modp:.1f}%")
+        print(f"avg_agent_prec: {avg_precision:.1f}%")
+        print(f"avg_agent_recall: {avg_recall:.1f}%")
+        print(f"avg_agent_f1: {avg_f1:.1f}%")
         print(f"avg_slot_loss: {avg_loss:.6f}")
-        print(f"avg_comm_cost: {avg_comm_cost:.4f}")
-        print(f"avg_num_messages: {avg_num_messages:.4f}")
-        print(
-            f"collab metrics -> "
-            f"moda: {moda:.1f}%, "
-            f"modp: {modp:.1f}%, "
-            f"prec: {precision:.1f}%, "
-            f"recall: {recall:.1f}%, "
-            f"f1: {f1:.1f}%"
-        )
-        print("=========================================")
+        print("==============================================")
 
         return {
-            "moda": moda,
-            "modp": modp,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
+            "agent_metrics": agent_metrics,
+            "avg_moda": avg_moda,
+            "avg_modp": avg_modp,
+            "avg_precision": avg_precision,
+            "avg_recall": avg_recall,
+            "avg_f1": avg_f1,
             "avg_slot_loss": avg_loss,
             **summary,
         }

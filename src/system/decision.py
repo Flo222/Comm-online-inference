@@ -24,6 +24,10 @@ class DecisionPolicy:
         return edges
 
     def decide_edges(self, node_ids, server_id='server'):
+
+        if self.mode == 'no_comm':
+            return []  
+        
         if self.mode == 'all_to_server':
             return [(nid, server_id) for nid in node_ids]
 

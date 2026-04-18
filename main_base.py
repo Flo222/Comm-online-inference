@@ -459,19 +459,21 @@ if __name__ == '__main__':
                         choices=['prefix', 'random'])
     
     parser.add_argument('--comm_topology', type=str, default='all_to_server',
-                        choices=[
-                            'all_to_server',
-                            'fully_connected',
-                            'ring',
-                            'chain',
-                            'custom'
-                        ])
+                        choices=['no_comm', 'all_to_server', 'fully_connected', 'ring', 'chain', 'custom'])
 
     parser.add_argument('--comm_self_loop', type=bool, default=False)
     parser.add_argument('--comm_bidirectional', type=bool, default=True)
 
     # custom topology 用，例如 "node_0->node_1,node_1->node_2,node_2->server"
     parser.add_argument('--comm_edges', type=str, default='')
+    parser.add_argument('--compress_mode', type=str, default='none',
+                        choices=['none', 'fp16', 'avgpool', 'topk'])
+    parser.add_argument('--quant_bits', type=int, default=16)
+    parser.add_argument('--topk_ratio', type=float, default=1.0)
+
+    # 加上这个，基线1更清楚
+    parser.add_argument('--agent_metric_avg', type=str, default='macro',
+                        choices=['macro', 'micro'])
 
     args = parser.parse_args()
     main(args)
