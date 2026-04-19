@@ -145,10 +145,11 @@ def build_logdir(args, is_debug):
                 f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
             )
         else:
+            bandit_tag = "_subsetbandit" if getattr(args, "use_subset_bandit", False) else ""
             logdir = (
                 f'logs/{args.dataset}/'
                 f'{"DEBUG_" if is_debug else ""}'
-                f'ONLINE_{args.online_mode}_{args.arch}_{args.aggregation}_'
+                f'ONLINE_{args.online_mode}{bandit_tag}_{args.arch}_{args.aggregation}_'
                 f'inferslots{args.online_infer_slots}_'
                 f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
             )
@@ -187,13 +188,6 @@ def build_model_and_runner(args, train_set, logdir):
 
 
 def load_resume_if_needed(args, model):
-    """
-    Priority:
-    1) --resume_path
-    2) --resume  -> logs/{dataset}/{resume}/model.pth
-    3) default checkpoint path (if use_default_ckpt=True)
-    4) random init
-    """
     ckpt_path = None
 
     if args.resume_path is not None:
@@ -202,7 +196,6 @@ def load_resume_if_needed(args, model):
         ckpt_path = f'logs/{args.dataset}/{args.resume}/model.pth'
     elif args.use_default_ckpt:
         default_ckpt_map = {
-            # 这里改成你已经验证能跑到 90.1 的那份模型
             'wildtrack': '/home/server2/online_inference/logs/wildtrack/resnet18_max_down1_lr0.0005_b1_e10_dropcam0.0_2026-04-06_21-38-52/model.pth',
             'multiviewx': '/home/server2/online_inference/logs/multiviewx/resnet18_max_down1_lr0.0005_b1_e10_dropcam0.0_2026-04-08_13-58-58/model.pth',
         }
@@ -320,6 +313,35 @@ def run_baseline(args, trainer, model, logdir, train_loader, test_loader):
         trainer.test(test_loader)
 
 
+def apply_static_policy(args):
+    """
+    不启用 subset bandit 时，按 static_policy 走固定策略。
+    启用 subset bandit 时，固定走 feature fusion，sender 子集由 OnlineRunner 动态决定。
+    """
+    if getattr(args, "use_subset_bandit", False):
+        args.comm_topology = "subset_bandit"
+        args.fusion_stage = "feature"
+        args.static_policy = "full_comm"
+        return
+
+    policy = getattr(args, "static_policy", "full_comm")
+
+    if policy == "no_comm":
+        args.comm_topology = "no_comm"
+        args.fusion_stage = "feature"
+
+    elif policy == "full_comm":
+        args.comm_topology = "fully_connected"
+        args.fusion_stage = "feature"
+
+    elif policy == "late_fusion_logits":
+        args.comm_topology = "fully_connected"
+        args.fusion_stage = "late_logits"
+
+    else:
+        raise ValueError(f"Unknown static_policy: {policy}")
+
+
 def run_online(args, model, train_set, test_set, logdir):
     if args.task != 'mvdet':
         raise ValueError('online mode currently only supports detection datasets [wildtrack, multiviewx]')
@@ -370,6 +392,9 @@ def main(args):
     train_set, val_set, test_set = build_datasets(args)
     train_loader, val_loader, test_loader = build_loaders(args, train_set, val_set, test_set)
 
+    if args.online:
+        apply_static_policy(args)
+
     logdir = build_logdir(args, is_debug)
     copy_scripts(logdir)
 
@@ -382,6 +407,20 @@ def main(args):
     load_resume_if_needed(args, model)
 
     if args.online:
+        if getattr(args, "use_subset_bandit", False):
+            print(
+                f'Using subset bandit over subset_arms={args.subset_arms}, '
+                f'subset_ucb_c={args.subset_ucb_c}, '
+                f'subset_reward_lambda={args.subset_reward_lambda}, '
+                f'subset_reward_beta_score={args.subset_reward_beta_score}, '
+                f'subset_reward_beta_count={args.subset_reward_beta_count}, '
+                f'subset_reward_count_momentum={args.subset_reward_count_momentum}'
+            )
+        else:
+            print(
+                f'Applied static_policy={args.static_policy} -> '
+                f'comm_topology={args.comm_topology}, fusion_stage={args.fusion_stage}'
+            )
         run_online(args, model, train_set, test_set, logdir)
     else:
         run_baseline(args, trainer, model, logdir, train_loader, test_loader)
@@ -447,33 +486,47 @@ if __name__ == '__main__':
     parser.add_argument('--comm_budget_mb', type=float, default=128.0)
     parser.add_argument('--comm_delay_ms', type=int, default=0)
     parser.add_argument('--comm_drop_prob', type=float, default=0.0)
-
-    # 先把 1 slot 定义成 100 ms，方便和论文对齐
     parser.add_argument('--slot_ms', type=int, default=100)
-
-    # 估算消息大小时先统一按 fp16 记账
     parser.add_argument('--comm_bits_per_value', type=int, default=16)
-
-    # 预算不够时的最简单策略
     parser.add_argument('--comm_budget_policy', type=str, default='prefix',
                         choices=['prefix', 'random'])
-    
-    parser.add_argument('--comm_topology', type=str, default='all_to_server',
-                        choices=['no_comm', 'all_to_server', 'fully_connected', 'ring', 'chain', 'custom'])
 
+    parser.add_argument('--comm_topology', type=str, default='all_to_server',
+                        choices=['no_comm', 'all_to_server', 'fully_connected', 'ring', 'chain', 'custom', 'subset_bandit'])
     parser.add_argument('--comm_self_loop', type=bool, default=False)
     parser.add_argument('--comm_bidirectional', type=bool, default=True)
-
-    # custom topology 用，例如 "node_0->node_1,node_1->node_2,node_2->server"
     parser.add_argument('--comm_edges', type=str, default='')
+
     parser.add_argument('--compress_mode', type=str, default='none',
                         choices=['none', 'fp16', 'avgpool', 'topk'])
     parser.add_argument('--quant_bits', type=int, default=16)
     parser.add_argument('--topk_ratio', type=float, default=1.0)
 
-    # 加上这个，基线1更清楚
     parser.add_argument('--agent_metric_avg', type=str, default='macro',
                         choices=['macro', 'micro'])
+
+    parser.add_argument('--static_policy', type=str, default='full_comm',
+                        choices=['no_comm', 'full_comm', 'late_fusion_logits'],
+                        help='online static policy')
+    parser.add_argument('--fusion_stage', type=str, default='feature',
+                        choices=['feature', 'late_logits'],
+                        help='internal fusion stage for online inference')
+
+    # subset bandit args
+    parser.add_argument('--use_subset_bandit', type=str2bool, default=False,
+                        help='use subset bandit on top of feature-map communication')
+    parser.add_argument('--subset_ucb_c', type=float, default=1.0,
+                        help='exploration coefficient for subset UCB')
+    parser.add_argument('--subset_reward_lambda', type=float, default=0.2,
+                        help='penalty coefficient for normalized communication cost')
+    parser.add_argument('--subset_reward_beta_score', type=float, default=0.5,
+                        help='reward weight for avg detection score proxy')
+    parser.add_argument('--subset_reward_beta_count', type=float, default=0.3,
+                        help='reward weight for detection-count penalty')
+    parser.add_argument('--subset_reward_count_momentum', type=float, default=0.9,
+                        help='EMA momentum for running detection-count reference')
+    parser.add_argument('--subset_arms', type=str, default='',
+                        help='subset arms, e.g. "0;1;0,2;1,3;0,2,4;all"')
 
     args = parser.parse_args()
     main(args)
