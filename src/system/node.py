@@ -1,4 +1,3 @@
-# src/system/node.py
 from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
@@ -24,7 +23,11 @@ class Node:
         self.current_slot: Optional[Dict] = None
         self.local_obs: Optional[Dict] = None
         self.local_output: Optional[Dict] = None
+
         self.local_world_feat: Optional[torch.Tensor] = None
+        self.local_world_heatmap: Optional[torch.Tensor] = None
+        self.local_world_offset: Optional[torch.Tensor] = None
+
         self.inbox: List[Message] = []
 
     def reset_slot(self):
@@ -32,6 +35,8 @@ class Node:
         self.local_obs = None
         self.local_output = None
         self.local_world_feat = None
+        self.local_world_heatmap = None
+        self.local_world_offset = None
         self.inbox = []
 
     def observe(self, slot_sample: Dict):
@@ -48,6 +53,16 @@ class Node:
             "cam_id": self.cam_id,
             "frame_id": self.current_slot.get("frame_id", None) if self.current_slot else None,
             "status": "local_world_feat_ready",
+        }
+
+    def set_local_world_prediction(self, world_heatmap: torch.Tensor, world_offset: torch.Tensor):
+        self.local_world_heatmap = world_heatmap
+        self.local_world_offset = world_offset
+        self.local_output = {
+            "node_id": self.node_id,
+            "cam_id": self.cam_id,
+            "frame_id": self.current_slot.get("frame_id", None) if self.current_slot else None,
+            "status": "local_world_prediction_ready",
         }
 
     def _compress_world_feat(self, world_feat: torch.Tensor) -> torch.Tensor:
@@ -73,6 +88,9 @@ class Node:
         return world_feat
 
     def build_message(self, receiver: str = "server", msg_type: str = "world_feat") -> Message:
+        if self.local_world_feat is None:
+            raise RuntimeError("local_world_feat is not ready.")
+
         compressed_feat = self._compress_world_feat(self.local_world_feat)
 
         payload = {
@@ -91,12 +109,46 @@ class Node:
             receiver=receiver,
             msg_type=msg_type,
             payload=payload,
-            size=elem_count,          # old field for compatibility
+            size=elem_count,
             bit_size=bit_size,
             slot_id=slot_id,
             send_slot=slot_id,
             meta={
+                "payload_type": "feature",
                 "compress_mode": self.compress_mode,
+                "quant_bits": self.quant_bits,
+            },
+        )
+
+    def build_logits_message(self, receiver: str, msg_type: str = "world_prediction") -> Message:
+        if self.local_world_heatmap is None or self.local_world_offset is None:
+            raise RuntimeError("local world prediction is not ready.")
+
+        payload = {
+            "node_id": self.node_id,
+            "cam_id": self.cam_id,
+            "world_heatmap": self.local_world_heatmap,
+            "world_offset": self.local_world_offset,
+        }
+
+        hm_count = int(self.local_world_heatmap.numel())
+        off_count = int(self.local_world_offset.numel())
+        elem_count = hm_count + off_count
+        bit_size = elem_count * int(self.quant_bits)
+
+        slot_id = self.current_slot["slot_id"] if self.current_slot else -1
+
+        return Message(
+            sender=self.node_id,
+            receiver=receiver,
+            msg_type=msg_type,
+            payload=payload,
+            size=elem_count,
+            bit_size=bit_size,
+            slot_id=slot_id,
+            send_slot=slot_id,
+            meta={
+                "payload_type": "logits",
                 "quant_bits": self.quant_bits,
             },
         )

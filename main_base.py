@@ -136,20 +136,25 @@ def build_logdir(args, is_debug):
             f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
         )
     elif args.online:
+        policy_tag = ""
+        if args.static_policy == "c2ucb_feature":
+            policy_tag = "_c2ucb"
+        elif args.static_policy == "logits_comm_late_fusion":
+            policy_tag = "_logitscomm"
+
         if args.online_mode == "train_then_infer":
             logdir = (
                 f'logs/{args.dataset}/'
                 f'{"DEBUG_" if is_debug else ""}'
-                f'ONLINE_train_then_infer_{args.arch}_{args.aggregation}_'
+                f'ONLINE_train_then_infer{policy_tag}_{args.arch}_{args.aggregation}_'
                 f'trainslots{args.online_train_slots}_inferslots{args.online_infer_slots}_'
                 f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
             )
         else:
-            bandit_tag = "_subsetbandit" if getattr(args, "use_subset_bandit", False) else ""
             logdir = (
                 f'logs/{args.dataset}/'
                 f'{"DEBUG_" if is_debug else ""}'
-                f'ONLINE_{args.online_mode}{bandit_tag}_{args.arch}_{args.aggregation}_'
+                f'ONLINE_{args.online_mode}{policy_tag}_{args.arch}_{args.aggregation}_'
                 f'inferslots{args.online_infer_slots}_'
                 f'dropcam{args.dropcam}_{datetime.datetime.today():%Y-%m-%d_%H-%M-%S}'
             )
@@ -314,16 +319,6 @@ def run_baseline(args, trainer, model, logdir, train_loader, test_loader):
 
 
 def apply_static_policy(args):
-    """
-    不启用 subset bandit 时，按 static_policy 走固定策略。
-    启用 subset bandit 时，固定走 feature fusion，sender 子集由 OnlineRunner 动态决定。
-    """
-    if getattr(args, "use_subset_bandit", False):
-        args.comm_topology = "subset_bandit"
-        args.fusion_stage = "feature"
-        args.static_policy = "full_comm"
-        return
-
     policy = getattr(args, "static_policy", "full_comm")
 
     if policy == "no_comm":
@@ -334,9 +329,13 @@ def apply_static_policy(args):
         args.comm_topology = "fully_connected"
         args.fusion_stage = "feature"
 
-    elif policy == "late_fusion_logits":
+    elif policy == "logits_comm_late_fusion":
         args.comm_topology = "fully_connected"
-        args.fusion_stage = "late_logits"
+        args.fusion_stage = "comm_logits_late"
+
+    elif policy == "c2ucb_feature":
+        args.comm_topology = "fully_connected"
+        args.fusion_stage = "feature"
 
     else:
         raise ValueError(f"Unknown static_policy: {policy}")
@@ -407,14 +406,16 @@ def main(args):
     load_resume_if_needed(args, model)
 
     if args.online:
-        if getattr(args, "use_subset_bandit", False):
+        if args.static_policy == "c2ucb_feature":
             print(
-                f'Using subset bandit over subset_arms={args.subset_arms}, '
-                f'subset_ucb_c={args.subset_ucb_c}, '
-                f'subset_reward_lambda={args.subset_reward_lambda}, '
-                f'subset_reward_beta_score={args.subset_reward_beta_score}, '
-                f'subset_reward_beta_count={args.subset_reward_beta_count}, '
-                f'subset_reward_count_momentum={args.subset_reward_count_momentum}'
+                "Using C2UCB-lite feature communication with "
+                f"alpha={args.c2ucb_alpha}, "
+                f"lambda_reg={args.c2ucb_lambda_reg}, "
+                f"max_active={args.c2ucb_max_active}, "
+                f"lambda_div={args.c2ucb_lambda_div}, "
+                f"lambda_comm={args.c2ucb_lambda_comm}, "
+                f"div_sigma={args.c2ucb_div_sigma}, "
+                f"context_dim={args.c2ucb_context_dim}"
             )
         else:
             print(
@@ -492,7 +493,7 @@ if __name__ == '__main__':
                         choices=['prefix', 'random'])
 
     parser.add_argument('--comm_topology', type=str, default='all_to_server',
-                        choices=['no_comm', 'all_to_server', 'fully_connected', 'ring', 'chain', 'custom', 'subset_bandit'])
+                        choices=['no_comm', 'all_to_server', 'fully_connected', 'ring', 'chain', 'custom'])
     parser.add_argument('--comm_self_loop', type=bool, default=False)
     parser.add_argument('--comm_bidirectional', type=bool, default=True)
     parser.add_argument('--comm_edges', type=str, default='')
@@ -506,27 +507,35 @@ if __name__ == '__main__':
                         choices=['macro', 'micro'])
 
     parser.add_argument('--static_policy', type=str, default='full_comm',
-                        choices=['no_comm', 'full_comm', 'late_fusion_logits'],
+                        choices=['no_comm', 'full_comm', 'logits_comm_late_fusion', 'c2ucb_feature'],
                         help='online static policy')
     parser.add_argument('--fusion_stage', type=str, default='feature',
-                        choices=['feature', 'late_logits'],
+                        choices=['feature', 'comm_logits_late'],
                         help='internal fusion stage for online inference')
 
-    # subset bandit args
-    parser.add_argument('--use_subset_bandit', type=str2bool, default=False,
-                        help='use subset bandit on top of feature-map communication')
-    parser.add_argument('--subset_ucb_c', type=float, default=1.0,
-                        help='exploration coefficient for subset UCB')
-    parser.add_argument('--subset_reward_lambda', type=float, default=0.2,
-                        help='penalty coefficient for normalized communication cost')
-    parser.add_argument('--subset_reward_beta_score', type=float, default=0.5,
-                        help='reward weight for avg detection score proxy')
-    parser.add_argument('--subset_reward_beta_count', type=float, default=0.3,
-                        help='reward weight for detection-count penalty')
-    parser.add_argument('--subset_reward_count_momentum', type=float, default=0.9,
-                        help='EMA momentum for running detection-count reference')
-    parser.add_argument('--subset_arms', type=str, default='',
-                        help='subset arms, e.g. "0;1;0,2;1,3;0,2,4;all"')
+    # C2UCB-lite args
+    parser.add_argument('--c2ucb_context_dim', type=int, default=10,
+                        help='context dimension for C2UCB-lite (keep synced with online_runner)')
+    parser.add_argument('--c2ucb_alpha', type=float, default=1.0,
+                        help='UCB exploration coefficient')
+    parser.add_argument('--c2ucb_lambda_reg', type=float, default=1.0,
+                        help='ridge regularization for linear UCB')
+    parser.add_argument('--c2ucb_max_active', type=int, default=4,
+                        help='maximum number of selected sender nodes')
+    parser.add_argument('--c2ucb_lambda_div', type=float, default=0.2,
+                        help='diversity weight in set utility')
+    parser.add_argument('--c2ucb_lambda_comm', type=float, default=0.1,
+                        help='communication penalty weight in set utility')
+    parser.add_argument('--c2ucb_div_sigma', type=float, default=1.0,
+                        help='sigma for logdet diversity regularizer')
+    parser.add_argument('--c2ucb_feedback_w_score', type=float, default=1.0,
+                        help='weight for local avg_score in semi-bandit feedback')
+    parser.add_argument('--c2ucb_feedback_w_count', type=float, default=0.5,
+                        help='weight for local count penalty in semi-bandit feedback')
+    parser.add_argument('--c2ucb_feedback_w_loss', type=float, default=0.5,
+                        help='weight for local pred loss in semi-bandit feedback')
+    parser.add_argument('--c2ucb_count_momentum', type=float, default=0.9,
+                        help='EMA momentum for per-view count reference')
 
     args = parser.parse_args()
     main(args)

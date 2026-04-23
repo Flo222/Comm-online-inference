@@ -1,0 +1,9 @@
+dataset,method,avg_agent_moda,avg_agent_modp,avg_agent_prec,avg_agent_recall,avg_agent_f1,avg_slot_loss,actual_total_comm_mb,full_comm_total_comm_mb,actual_total_messages,full_comm_total_messages,comm_ratio_percent,comm_saving_percent
+wildtrack,full_comm,90.1,81.9,93.3,97.1,95.2,0.444243,18579.456,18579.456,1680,1680,100.0,0.0
+wildtrack,no_comm,32.3,71.9,95.3,33.9,48.0,1.278471,0.0,18579.456,0,1680,0.0,100.0
+wildtrack,logits_comm_late_fusion,78.5,76.4,86.6,92.9,89.6,0.993467,435.456,18579.456,1680,1680,2.34375,97.65625
+wildtrack,c2ucb_feature,86.8,80.6,94.4,92.3,93.3,0.495793,10616.832,18579.456,960,1680,57.142857142857146,42.857142857142854
+multiviewx,full_comm,93.6,90.4,97.9,95.6,96.8,0.259893,12288.0,12288.0,1200,1200,100.0,0.0
+multiviewx,no_comm,32.9,72.5,87.9,38.4,52.8,1.246144,0.0,12288.0,0,1200,0.0,100.0
+multiviewx,logits_comm_late_fusion,52.2,76.8,70.5,89.8,79.0,0.968054,288.0,12288.0,1200,1200,2.34375,97.65625
+multiviewx,c2ucb_feature,87.0,88.2,96.5,90.3,93.3,0.343191,8192.0,12288.0,800,1200,66.66666666666667,33.33333333333333
