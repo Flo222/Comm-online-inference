@@ -201,8 +201,8 @@ def load_resume_if_needed(args, model):
         ckpt_path = f'logs/{args.dataset}/{args.resume}/model.pth'
     elif args.use_default_ckpt:
         default_ckpt_map = {
-            'wildtrack': '/home/server2/online_inference/logs/wildtrack/resnet18_max_down1_lr0.0005_b1_e10_dropcam0.0_2026-04-06_21-38-52/model.pth',
-            'multiviewx': '/home/server2/online_inference/logs/multiviewx/resnet18_max_down1_lr0.0005_b1_e10_dropcam0.0_2026-04-08_13-58-58/model.pth',
+            'wildtrack': '/home/server2/Comm-online-inference/logs/wildtrack/resnet18_max_down1_lr0.0005_b1_e10_dropcam0.0_2026-04-06_21-38-52/model.pth',
+            'multiviewx': '/home/server2/Comm-online-inference/logs/multiviewx/BASELINE_resnet18_max_lr0.0005_b1_e10_dropcam0.0_2026-04-26_22-05-20/model.pth',
         }
         ckpt_path = default_ckpt_map.get(args.dataset, None)
 
