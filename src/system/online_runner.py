@@ -740,22 +740,46 @@ class OnlineRunner:
             recv_from = []
 
             if fusion_stage == "feature":
-                feat_list = [node_map[receiver_id].local_world_feat]
+                # feat_list = [node_map[receiver_id].local_world_feat]
+
+                # for msg in recv_msgs:
+                #     wf = msg.payload.get("world_feat", None)
+                #     sender = msg.payload.get("node_id", None)
+                #     if wf is None:
+                #         continue
+
+                #     wf = wf.to(feat_all.dtype)
+                #     if sender == receiver_id:
+                #         continue
+
+                #     feat_list.append(wf)
+                #     recv_from.append(sender)
+
+                # fused_feat = self._fuse_world_features(feat_list)
+                feat_mask_list = [
+                    (node_map[receiver_id].local_world_feat, None)
+                ]
 
                 for msg in recv_msgs:
                     wf = msg.payload.get("world_feat", None)
                     sender = msg.payload.get("node_id", None)
+
                     if wf is None:
                         continue
 
-                    wf = wf.to(feat_all.dtype)
                     if sender == receiver_id:
                         continue
 
-                    feat_list.append(wf)
+                    wf = wf.to(feat_all.dtype)
+
+                    channel_valid_mask = msg.payload.get("channel_valid_mask", None)
+                    if channel_valid_mask is not None:
+                        channel_valid_mask = channel_valid_mask.to(wf.device)
+
+                    feat_mask_list.append((wf, channel_valid_mask))
                     recv_from.append(sender)
 
-                fused_feat = self._fuse_world_features(feat_list)
+                fused_feat = self._fuse_world_features_mask_aware(feat_mask_list)
                 world_heatmap_i, world_offset_i = self.model.get_output(fused_feat)
 
                 agent_outputs[receiver_id] = {
@@ -1194,6 +1218,10 @@ class OnlineRunner:
                     f"messages={comm_stats.get('num_messages', 0)} "
                     f"delivered={comm_stats.get('delivered_messages', 0)} "
                     f"dropped={comm_stats.get('dropped_messages', 0)} "
+                    f"packets={comm_stats.get('total_packets', 0)} "
+                    f"lost_packets={comm_stats.get('lost_packets', 0)} "
+                    f"pkt_loss={comm_stats.get('packet_loss_rate', 0.0):.3f} "
+                    f"partial_msgs={comm_stats.get('partial_messages', 0)} "
                     f"comm_mb={comm_stats.get('comm_cost_mb', 0.0):.3f} "
                     f"avg_delay_slots={comm_stats.get('avg_delay_slots', 0.0):.2f} "
                     f"loss={loss.item():.6f}"
@@ -1315,3 +1343,72 @@ class OnlineRunner:
             )
         else:
             raise ValueError(f"Unknown online_mode: {self.args.online_mode}")
+
+    def _fuse_world_features_mask_aware(self, feat_mask_list):
+        """
+        feat_mask_list: list of (feat, channel_valid_mask)
+
+        feat:
+        [B, C, H, W] or [C, H, W]
+
+        channel_valid_mask:
+        [C], bool
+        True = valid
+        False = missing
+        """
+
+        feats = []
+        masks = []
+
+        for feat, mask in feat_mask_list:
+            if mask is None:
+                if feat.dim() == 4:
+                    C = feat.shape[1]
+                else:
+                    C = feat.shape[0]
+                mask = torch.ones(C, device=feat.device, dtype=torch.bool)
+
+            mask = mask.to(device=feat.device)
+
+            if feat.dim() == 4:
+                mask_view = mask.view(1, -1, 1, 1)
+            else:
+                mask_view = mask.view(-1, 1, 1)
+
+            feats.append(feat)
+            masks.append(mask_view)
+
+        if self.model.aggregation == "max":
+            masked_feats = []
+            for feat, mask_view in zip(feats, masks):
+                masked_feats.append(
+                    torch.where(
+                        mask_view,
+                        feat,
+                        torch.full_like(feat, -1e4),
+                    )
+                )
+
+            fused = torch.stack(masked_feats, dim=1).max(dim=1)[0]
+            return fused
+
+        elif self.model.aggregation == "mean":
+            weighted_sum = None
+            valid_count = None
+
+            for feat, mask_view in zip(feats, masks):
+                valid = mask_view.to(dtype=feat.dtype)
+                cur = feat * valid
+
+                if weighted_sum is None:
+                    weighted_sum = cur
+                    valid_count = valid
+                else:
+                    weighted_sum = weighted_sum + cur
+                    valid_count = valid_count + valid
+
+            fused = weighted_sum / valid_count.clamp_min(1.0)
+            return fused
+
+        else:
+            raise ValueError(f"Unsupported aggregation: {self.model.aggregation}")

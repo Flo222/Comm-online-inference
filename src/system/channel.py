@@ -357,6 +357,8 @@ class ChannelModel:
         packet_loss_probs: List[float] = []
         lost_packets = 0
 
+        channel_valid_mask = torch.ones(C, device=feat.device, dtype=torch.bool)
+
         for c0, c1 in packets:
             lost, packet_meta = self._sample_packet_loss(msg)
             packet_mask.append(0 if lost else 1)
@@ -366,14 +368,17 @@ class ChannelModel:
             if not lost:
                 continue
 
-            lost_packets += 1
+            if lost:
+                lost_packets += 1
+                channel_valid_mask[c0:c1] = False
 
-            if channel_dim == 0:
-                out_feat[c0:c1, :, :] = 0
-            else:
-                out_feat[:, c0:c1, :, :] = 0
+                if channel_dim == 0:
+                    out_feat[c0:c1, :, :] = 0
+                else:
+                    out_feat[:, c0:c1, :, :] = 0
 
         msg.payload["world_feat"] = out_feat
+        msg.payload["channel_valid_mask"] = channel_valid_mask
 
         total_packets = len(packets)
         packet_loss_rate = lost_packets / max(total_packets, 1)
