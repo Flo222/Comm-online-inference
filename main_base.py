@@ -551,5 +551,68 @@ if __name__ == '__main__':
         choices=['single_view_realistic'],
     )
 
+    parser.add_argument(
+        '--comm_channel_model',
+        type=str,
+        default='bernoulli',
+        choices=['bernoulli', 'gilbert_elliott'],
+        help='packet loss process: independent Bernoulli or bursty Gilbert-Elliott'
+    )
+
+    parser.add_argument(
+        '--loss_granularity',
+        type=str,
+        default='message',
+        choices=['message', 'channel'],
+        help='message: drop whole message; channel: drop channel-wise feature packets'
+    )
+
+    parser.add_argument(
+        '--packetize_mode',
+        type=str,
+        default='fixed',
+        choices=['fixed', 'size'],
+        help='fixed: fixed channel group size; size: estimate packet by packet_max_bytes'
+    )
+
+    parser.add_argument(
+        '--channel_group_size',
+        type=int,
+        default=16,
+        help='number of feature channels per packet when packetize_mode=fixed'
+    )
+
+    parser.add_argument(
+        '--packet_max_bytes',
+        type=int,
+        default=6400,
+        help='maximum packet size in bytes when packetize_mode=size'
+    )
+
+    parser.add_argument('--ge_p', type=float, default=0.378563411896744,
+                        help='Gilbert-Elliott P(Good -> Bad)')
+    parser.add_argument('--ge_r', type=float, default=0.883314627759071,
+                        help='Gilbert-Elliott P(Bad -> Good)')
+    parser.add_argument('--ge_h', type=float, default=0.810,
+                        help='Gilbert-Elliott success probability in Bad state')
+    parser.add_argument('--ge_k', type=float, default=0.938571428571429,
+                        help='Gilbert-Elliott success probability in Good state')
+
+    parser.add_argument(
+        '--ge_scope',
+        type=str,
+        default='link',
+        choices=['global', 'link'],
+        help='global: one GE state for all messages; link: one GE state per sender-receiver link'
+    )
+
+    parser.add_argument(
+        '--ge_init_state',
+        type=str,
+        default='G',
+        choices=['G', 'B'],
+        help='initial Gilbert-Elliott state'
+    )
+
     args = parser.parse_args()
     main(args)

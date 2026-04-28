@@ -130,6 +130,20 @@ class OnlineRunner:
             slot_ms=getattr(args, "slot_ms", 100),
             bits_per_value=getattr(args, "comm_bits_per_value", 16),
             budget_policy=getattr(args, "comm_budget_policy", "prefix"),
+            rng_seed=getattr(args, "seed", None),
+
+            channel_model=getattr(args, "comm_channel_model", "bernoulli"),
+            loss_granularity=getattr(args, "loss_granularity", "message"),
+            packetize_mode=getattr(args, "packetize_mode", "fixed"),
+            channel_group_size=getattr(args, "channel_group_size", 16),
+            packet_max_bytes=getattr(args, "packet_max_bytes", 6400),
+
+            ge_p=getattr(args, "ge_p", 0.378563411896744),
+            ge_r=getattr(args, "ge_r", 0.883314627759071),
+            ge_h=getattr(args, "ge_h", 0.810),
+            ge_k=getattr(args, "ge_k", 0.938571428571429),
+            ge_scope=getattr(args, "ge_scope", "link"),
+            ge_init_state=getattr(args, "ge_init_state", "G"),
         )
 
         self.comm_manager = CommManager(channel=channel)
