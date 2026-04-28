@@ -299,6 +299,78 @@ class frameDataset(VisionDataset):
     def __len__(self):
         return len(self.world_gt.keys())
 
+    def get_single_cam_slot(self, index: int, cam_idx: int, visualize: bool = False):
+        """
+        真正的单节点 slot 加载器
+
+        输入:
+            index: dataset index / slot dataset_idx
+            cam_idx: 当前节点相机编号
+
+        输出:
+            该节点自己的 image、affine、img_gt、frame 元信息。
+        """
+        frame = list(self.world_gt.keys())[index]
+
+        img_path = self.img_fpaths[cam_idx][frame]
+        img = np.array(Image.open(img_path).convert('RGB'))
+
+        img_bboxs, img_pids = self.imgs_gt[frame][cam_idx]
+
+        if self.augmentation:
+            img, img_bboxs, img_pids, M = random_affine(img, img_bboxs, img_pids)
+        else:
+            M = np.eye(3)
+
+        img_tensor = self.transform(img)
+        affine_mat = torch.from_numpy(M).float()
+
+        img_x_s = (img_bboxs[:, 0] + img_bboxs[:, 2]) / 2
+        img_y_s = img_bboxs[:, 3]
+        img_w_s = img_bboxs[:, 2] - img_bboxs[:, 0]
+        img_h_s = img_bboxs[:, 3] - img_bboxs[:, 1]
+
+        img_gt = get_gt(
+            self.Rimg_shape,
+            img_x_s,
+            img_y_s,
+            img_w_s,
+            img_h_s,
+            v_s=img_pids,
+            reduce=self.img_reduce,
+            top_k=self.top_k,
+            kernel_size=self.img_kernel_size,
+        )
+
+        # world_gt 只给 runner 计算 loss/eval 用，不代表真实节点知道 GT
+        world_pt_s, world_pid_s = self.world_gt[frame]
+        world_gt = get_gt(
+            self.Rworld_shape,
+            world_pt_s[:, 0],
+            world_pt_s[:, 1],
+            v_s=world_pid_s,
+            reduce=self.world_reduce,
+            top_k=self.top_k,
+            kernel_size=self.world_kernel_size,
+        )
+
+        return {
+            "slot_id": index,
+            "dataset_idx": index,
+            "frame_id": frame,
+            "cam_idx": cam_idx,
+            "image": img_tensor,
+            "affine_mat": affine_mat,
+            "img_gt": img_gt,
+            "world_gt": world_gt,
+            "keep_cam": torch.tensor(True, dtype=torch.bool),
+            "meta": {
+                "img_path": img_path,
+                "cam_idx": cam_idx,
+                "frame_id": frame,
+            },
+        }
+
 
 def test(test_projection=False):
     from torch.utils.data import DataLoader

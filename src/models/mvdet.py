@@ -114,8 +114,23 @@ class MVDet(MultiviewBase):
         self.world_heatmap[-1].bias.data.fill_(-2.19)
         fill_fc_weights(self.world_offset)
 
-    def get_feat(self, imgs, M, down=1, visualize=False):
+    def get_feat(self, imgs, M, down=1, visualize=False, cam_indices=None):
+        """
+        imgs: [B, N, C, H, W]
+        M:    [B, N, 3, 3]
+        cam_indices:
+            None -> 默认使用 [0, 1, ..., N-1]，兼容原始集中式写法
+            list[int] -> 显式指定每一路输入图像对应的真实相机编号
+        """
         B, N, _, _, _ = imgs.shape
+
+        if cam_indices is None:
+            cam_indices = list(range(N))
+        if isinstance(cam_indices, int):
+            cam_indices = [cam_indices]
+        assert len(cam_indices) == N, \
+            f"len(cam_indices)={len(cam_indices)} must equal N={N}"
+
         imgs = F.interpolate(imgs.flatten(0, 1), scale_factor=1 / down)
 
         inverse_affine_mats = torch.inverse(M.view(B * N, 3, 3))
@@ -130,28 +145,21 @@ class MVDet(MultiviewBase):
 
         imgcoord_from_Rimggrid_mat = inverse_affine_mats @ scale_mat
 
+        cam_indices = torch.as_tensor(
+            cam_indices,
+            dtype=torch.long,
+            device=self.proj_mats.device,
+        )
+
+        selected_proj_mats = self.proj_mats.index_select(0, cam_indices)
+
         proj_mats = (
-            self.proj_mats[:N]
+            selected_proj_mats
             .to(device=imgs.device, dtype=imgs.dtype)
             .unsqueeze(0)
             .repeat(B, 1, 1, 1)
             .flatten(0, 1)
         ) @ imgcoord_from_Rimggrid_mat
-
-        if visualize:
-            denorm = img_color_denormalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-            proj_imgs = warp_perspective(
-                F.interpolate(imgs, scale_factor=1 / 8),
-                proj_mats,
-                (self.Rworld_shape / down).astype(int)
-            ).unflatten(0, [B, N])
-            for cam in range(N):
-                visualize_img = T.ToPILImage()(denorm(imgs.detach())[cam * B])
-                plt.imshow(visualize_img)
-                plt.show()
-                visualize_img = T.ToPILImage()(denorm(proj_imgs.detach())[0, cam])
-                plt.imshow(visualize_img)
-                plt.show()
 
         imgs_feat = self.base(imgs)
         imgs_feat = self.bottleneck(imgs_feat)
@@ -160,23 +168,11 @@ class MVDet(MultiviewBase):
         imgs_offset = self.img_offset(imgs_feat)
         imgs_wh = self.img_wh(imgs_feat)
 
-        if visualize:
-            for cam in range(N):
-                visualize_img = array2heatmap(torch.norm(imgs_feat[cam * B].detach(), dim=0).cpu())
-                plt.imshow(visualize_img)
-                plt.show()
-
         world_feat = warp_perspective(
             imgs_feat,
             proj_mats,
-            tuple(self.Rworld_shape.tolist())
+            tuple(self.Rworld_shape.tolist()),
         ).unflatten(0, [B, N])
-
-        if visualize:
-            for cam in range(N):
-                visualize_img = array2heatmap(torch.norm(world_feat[0, cam].detach(), dim=0).cpu())
-                plt.imshow(visualize_img)
-                plt.show()
 
         aux_res = (
             F.interpolate(imgs_heatmap, tuple(self.Rimg_shape.tolist())),
@@ -185,6 +181,40 @@ class MVDet(MultiviewBase):
         )
 
         return world_feat, aux_res
+
+
+    def get_feat_single_cam_correct(self, img, affine_mat, cam_idx, down=1, visualize=False):
+        """
+        单节点真实推理接口。
+
+        img:
+            [C, H, W] or [B, C, H, W]
+        affine_mat:
+            [3, 3] or [B, 3, 3]
+        cam_idx:
+            当前节点对应的真实相机编号
+        return:
+            local_world_feat: [B, C, H_world, W_world]
+            aux_res: image-level heatmap / offset / wh
+        """
+        if img.dim() == 3:
+            img = img.unsqueeze(0)          # [1, C, H, W]
+        if affine_mat.dim() == 2:
+            affine_mat = affine_mat.unsqueeze(0)  # [1, 3, 3]
+
+        imgs = img.unsqueeze(1)             # [B, 1, C, H, W]
+        affine_mats = affine_mat.unsqueeze(1)  # [B, 1, 3, 3]
+
+        world_feat, aux_res = self.get_feat(
+            imgs,
+            affine_mats,
+            down=down,
+            visualize=visualize,
+            cam_indices=[int(cam_idx)],
+        )
+
+        local_world_feat = world_feat[:, 0]  # [B, C, H_world, W_world]
+        return local_world_feat, aux_res
 
     def get_output(self, world_feat, visualize=False):
         world_feat = self.world_feat(world_feat)

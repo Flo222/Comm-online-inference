@@ -536,6 +536,20 @@ if __name__ == '__main__':
                         help='weight for local pred loss in semi-bandit feedback')
     parser.add_argument('--c2ucb_count_momentum', type=float, default=0.9,
                         help='EMA momentum for per-view count reference')
+    
+    parser.add_argument(
+        '--decentralized',
+        type=str2bool,
+        default=True,
+        help='use true decentralized local single-camera loading',
+    )
+
+    parser.add_argument(
+        '--local_infer_mode',
+        type=str,
+        default='single_view_realistic',
+        choices=['single_view_realistic'],
+    )
 
     args = parser.parse_args()
     main(args)

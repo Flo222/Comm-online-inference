@@ -13,6 +13,7 @@ from src.loss import focal_loss, regL1loss
 from src.evaluation.evaluate import evaluate
 from src.utils.decode import mvdet_decode
 from src.utils.nms import nms
+from src.system.local_slot_loader import LocalSlotLoader
 
 
 class LinearC2UCBBandit:
@@ -87,6 +88,9 @@ class OnlineRunner:
         self.logdir = logdir
         self.args = args
         self.optimizer = optimizer
+
+        self.train_local_loader = LocalSlotLoader(train_dataset)
+        self.test_local_loader = LocalSlotLoader(test_dataset)
 
         self.train_stream = OnlineStream(train_dataset, sort_by_time=True)
         self.test_stream = OnlineStream(test_dataset, sort_by_time=True)
@@ -235,9 +239,7 @@ class OnlineRunner:
                 out[k] = v
         return out
 
-    def _reset_for_slot(self, slot_sample):
-        slot_id = slot_sample["slot_id"]
-
+    def _reset_for_slot(self, slot_id):
         if hasattr(self.comm_manager, "reset_slot_stats"):
             self.comm_manager.reset_slot_stats()
         elif hasattr(self.comm_manager, "reset_slot"):
@@ -251,7 +253,152 @@ class OnlineRunner:
 
         for node in self.nodes:
             node.reset_slot()
-            node.observe(slot_sample)
+
+    def infer_local_feature(
+        self,
+        slot_id: int,
+        cam_idx: int,
+        dataset,
+        mode: str = "single_view_realistic",
+        force_local_prediction: bool = True,
+    ):
+        """
+        真正的节点本地推理。
+
+        每个节点只做：
+        1. 加载自己的单路图像
+        2. 加载自己的 affine
+        3. 调用 get_feat_single_cam_correct
+        4. 得到 local_world_feat
+        5. 可选：本地 get_output 得到 logits / heatmap / offset
+        """
+        loader = (
+            self.train_local_loader
+            if dataset is self.train_dataset
+            else self.test_local_loader
+        )
+
+        local_slot = loader.load(slot_id, cam_idx)
+        node = self.nodes[cam_idx]
+
+        node.observe({
+            "slot_id": slot_id,
+            "frame_id": local_slot["frame_id"],
+            "cam_idx": cam_idx,
+            "meta": local_slot.get("meta", {}),
+        })
+
+        img = local_slot["image"].unsqueeze(0).cuda(non_blocking=True)
+        affine_mat = local_slot["affine_mat"].unsqueeze(0).cuda(non_blocking=True)
+
+        local_world_feat, aux_res = self.model.get_feat_single_cam_correct(
+            img,
+            affine_mat,
+            cam_idx=cam_idx,
+            down=self.args.down,
+            visualize=False,
+        )
+
+        node.set_local_world_feat(local_world_feat)
+
+        # logits_comm 必须本地先 get_output；
+        # c2ucb 也需要本地预测来构造 context；
+        # no_comm 也可以直接复用本地 prediction。
+        need_local_prediction = (
+            force_local_prediction
+            or mode == "logits_comm"
+            or getattr(self.args, "fusion_stage", "feature") == "comm_logits_late"
+            or self._uses_c2ucb()
+        )
+
+        if need_local_prediction:
+            local_world_heatmap, local_world_offset = self.model.get_output(
+                local_world_feat
+            )
+            node.set_local_world_prediction(
+                local_world_heatmap,
+                local_world_offset,
+            )
+
+        imgs_heatmap, imgs_offset, imgs_wh = aux_res
+
+        return {
+            "slot_id": slot_id,
+            "cam_idx": cam_idx,
+            "frame_id": local_slot["frame_id"],
+            "local_world_feat": local_world_feat,
+            "imgs_heatmap": imgs_heatmap,
+            "imgs_offset": imgs_offset,
+            "imgs_wh": imgs_wh,
+            "img_gt": local_slot["img_gt"],
+            "world_gt": local_slot["world_gt"],
+            "keep_cam": local_slot["keep_cam"],
+            "meta": local_slot.get("meta", {}),
+        }
+
+    def _infer_all_nodes_locally(self, slot_id: int, dataset):
+        local_records = []
+
+        for cam_idx in range(len(self.nodes)):
+            record = self.infer_local_feature(
+                slot_id=slot_id,
+                cam_idx=cam_idx,
+                dataset=dataset,
+                mode=getattr(self.args, "local_infer_mode", "single_view_realistic"),
+                force_local_prediction=True,
+            )
+            local_records.append(record)
+
+        # 这里只是为了兼容原有 loss 计算，不用于中心化特征融合
+        feat_all = torch.stack(
+            [self.nodes[i].local_world_feat for i in range(len(self.nodes))],
+            dim=1,
+        )
+
+        imgs_heatmap = torch.cat(
+            [r["imgs_heatmap"] for r in local_records],
+            dim=0,
+        )
+        imgs_offset = torch.cat(
+            [r["imgs_offset"] for r in local_records],
+            dim=0,
+        )
+        imgs_wh = torch.cat(
+            [r["imgs_wh"] for r in local_records],
+            dim=0,
+        )
+
+        keep_cams = torch.stack(
+            [r["keep_cam"] for r in local_records],
+            dim=0,
+        ).unsqueeze(0)
+
+        imgs_gt = {}
+        for key in local_records[0]["img_gt"].keys():
+            imgs_gt[key] = torch.stack(
+                [r["img_gt"][key] for r in local_records],
+                dim=0,
+            ).unsqueeze(0)
+
+        world_gt = self._ensure_gt_batch_dim(local_records[0]["world_gt"])
+
+        frame = local_records[0]["frame_id"]
+        if not torch.is_tensor(frame):
+            frame = torch.tensor([frame])
+        elif frame.dim() == 0:
+            frame = frame.unsqueeze(0)
+
+        return (
+            feat_all,
+            imgs_heatmap,
+            imgs_offset,
+            imgs_wh,
+            keep_cams,
+            world_gt,
+            imgs_gt,
+            frame,
+            local_records,
+        )
 
     def _make_decision(self, selected_senders=None):
         if selected_senders is not None:
@@ -702,25 +849,100 @@ class OnlineRunner:
                 )
                 res_list.append(res)
 
-    def _run_one_slot(self, slot_sample, dataset, train_mode=False):
-        slot_id = slot_sample["slot_id"]
-        self._reset_for_slot(slot_sample)
+    # def _run_one_slot(self, slot_sample, dataset, train_mode=False):
+    #     slot_id = slot_sample["slot_id"]
+    #     self._reset_for_slot(slot_sample)
 
-        imgs, affine_mats, keep_cams, world_gt, imgs_gt, frame = self._normalize_slot_tensors(slot_sample)
-        imgs = imgs.cuda()
-        affine_mats = affine_mats.cuda()
+    #     imgs, affine_mats, keep_cams, world_gt, imgs_gt, frame = self._normalize_slot_tensors(slot_sample)
+    #     imgs = imgs.cuda()
+    #     affine_mats = affine_mats.cuda()
 
-        feat_all, imgs_heatmap, imgs_offset, imgs_wh = self._extract_slot_features(imgs, affine_mats)
-        self._prepare_local_node_states(feat_all)
+    #     feat_all, imgs_heatmap, imgs_offset, imgs_wh = self._extract_slot_features(imgs, affine_mats)
+    #     self._prepare_local_node_states(feat_all)
+
+    #     local_stats = None
+    #     oracle_info = {}
+    #     selected_indices = None
+
+    #     if self._uses_c2ucb():
+    #         context_dict, local_stats = self._build_view_contexts(feat_all, world_gt, dataset)
+    #         scored_contexts = self.c2ucb_bandit.score_all(context_dict)
+    #         selected_indices, oracle_info = self._oracle_greedy_select(scored_contexts, context_dict)
+    #         decision, active_nodes = self._make_decision(selected_indices)
+    #     else:
+    #         decision, active_nodes = self._make_decision(None)
+
+    #     loss, agent_outputs = self._forward_and_loss_collab_precomputed(
+    #         dataset=dataset,
+    #         feat_all=feat_all,
+    #         imgs_heatmap=imgs_heatmap,
+    #         imgs_offset=imgs_offset,
+    #         imgs_wh=imgs_wh,
+    #         keep_cams=keep_cams,
+    #         world_gt=world_gt,
+    #         imgs_gt=imgs_gt,
+    #     )
+
+    #     comm_stats = self.comm_manager.get_slot_stats()
+
+    #     c2ucb_info = {}
+    #     if self._uses_c2ucb():
+    #         reward_dict = self._compute_selected_view_feedback(selected_indices, local_stats)
+    #         self.c2ucb_bandit.update(selected_indices, context_dict, reward_dict)
+    #         self._commit_round_history(local_stats, selected_indices)
+
+    #         c2ucb_info = {
+    #             "selected_indices": selected_indices,
+    #             "selected_str": ",".join(str(i) for i in selected_indices),
+    #             "avg_feedback_selected": float(np.mean([reward_dict[i] for i in selected_indices])),
+    #             "oracle_utility": oracle_info["oracle_utility"],
+    #             "oracle_selected_size": oracle_info["selected_size"],
+    #             "oracle_ucb_mean": oracle_info["selected_ucb_mean"],
+    #             "oracle_mean_mean": oracle_info["selected_mean_mean"],
+    #             "oracle_bonus_mean": oracle_info["selected_bonus_mean"],
+    #         }
+
+    #     return {
+    #         "slot_id": slot_id,
+    #         "loss": loss,
+    #         "agent_outputs": agent_outputs,
+    #         "frame": frame,
+    #         "decision": decision,
+    #         "active_nodes": active_nodes,
+    #         "comm_stats": comm_stats,
+    #         "c2ucb_info": c2ucb_info,
+    #     }
+
+    def _run_one_slot(self, slot_id, dataset, train_mode=False):
+        self._reset_for_slot(slot_id)
+
+        (
+            feat_all,
+            imgs_heatmap,
+            imgs_offset,
+            imgs_wh,
+            keep_cams,
+            world_gt,
+            imgs_gt,
+            frame,
+            local_records,
+        ) = self._infer_all_nodes_locally(slot_id, dataset)
 
         local_stats = None
         oracle_info = {}
         selected_indices = None
 
         if self._uses_c2ucb():
-            context_dict, local_stats = self._build_view_contexts(feat_all, world_gt, dataset)
+            context_dict, local_stats = self._build_view_contexts(
+                feat_all,
+                world_gt,
+                dataset,
+            )
             scored_contexts = self.c2ucb_bandit.score_all(context_dict)
-            selected_indices, oracle_info = self._oracle_greedy_select(scored_contexts, context_dict)
+            selected_indices, oracle_info = self._oracle_greedy_select(
+                scored_contexts,
+                context_dict,
+            )
             decision, active_nodes = self._make_decision(selected_indices)
         else:
             decision, active_nodes = self._make_decision(None)
@@ -740,14 +962,23 @@ class OnlineRunner:
 
         c2ucb_info = {}
         if self._uses_c2ucb():
-            reward_dict = self._compute_selected_view_feedback(selected_indices, local_stats)
-            self.c2ucb_bandit.update(selected_indices, context_dict, reward_dict)
+            reward_dict = self._compute_selected_view_feedback(
+                selected_indices,
+                local_stats,
+            )
+            self.c2ucb_bandit.update(
+                selected_indices,
+                context_dict,
+                reward_dict,
+            )
             self._commit_round_history(local_stats, selected_indices)
 
             c2ucb_info = {
                 "selected_indices": selected_indices,
                 "selected_str": ",".join(str(i) for i in selected_indices),
-                "avg_feedback_selected": float(np.mean([reward_dict[i] for i in selected_indices])),
+                "avg_feedback_selected": float(
+                    np.mean([reward_dict[i] for i in selected_indices])
+                ),
                 "oracle_utility": oracle_info["oracle_utility"],
                 "oracle_selected_size": oracle_info["selected_size"],
                 "oracle_ucb_mean": oracle_info["selected_ucb_mean"],
@@ -774,11 +1005,15 @@ class OnlineRunner:
         losses = 0.0
         num_steps = 0
 
-        for i, slot_sample in enumerate(self.train_stream):
-            if max_slots is not None and i >= max_slots:
+        for slot_id in range(len(self.train_dataset)):
+            if max_slots is not None and slot_id >= max_slots:
                 break
 
-            out = self._run_one_slot(slot_sample, dataset=self.train_dataset, train_mode=True)
+            out = self._run_one_slot(
+                slot_id,
+                dataset=self.train_dataset,
+                train_mode=True,
+            )
             slot_id = out["slot_id"]
             loss = out["loss"]
             decision = out["decision"]
@@ -860,12 +1095,15 @@ class OnlineRunner:
         c2ucb_trace = []
 
         with torch.no_grad():
-            for i, slot_sample in enumerate(self.test_stream):
-                if max_slots is not None and i >= max_slots:
+            for slot_id in range(len(self.test_dataset)):
+                if max_slots is not None and slot_id >= max_slots:
                     break
 
-                out = self._run_one_slot(slot_sample, dataset=self.test_dataset, train_mode=False)
-
+                out = self._run_one_slot(
+                    slot_id,
+                    dataset=self.test_dataset,
+                    train_mode=False,
+                )
                 slot_id = out["slot_id"]
                 loss = out["loss"]
                 agent_outputs = out["agent_outputs"]
