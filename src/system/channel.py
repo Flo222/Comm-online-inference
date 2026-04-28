@@ -257,6 +257,15 @@ class ChannelModel:
             c1 = min(c0 + channels_per_packet, C)
             packets.append((c0, c1))
 
+        # meta = {
+        #     "packetize_mode": self.packetize_mode,
+        #     "packet_max_bytes": self.packet_max_bytes,
+        #     "bytes_per_channel_est": bytes_per_channel,
+        #     "channels_per_packet": channels_per_packet,
+        #     "total_packets": len(packets),
+        #     "total_channels": C,
+        # }
+
         meta = {
             "packetize_mode": self.packetize_mode,
             "packet_max_bytes": self.packet_max_bytes,
@@ -265,6 +274,23 @@ class ChannelModel:
             "total_packets": len(packets),
             "total_channels": C,
         }
+
+        # 只打印一次，避免每个 message 都刷屏
+        if not hasattr(self, "_printed_packetize_debug"):
+            print(
+                "[DEBUG packetize]",
+                "mode=", self.packetize_mode,
+                "C=", C,
+                "H=", H,
+                "W=", W,
+                "bits_per_value=", bits_per_value,
+                "bytes_per_channel=", bytes_per_channel,
+                "packet_max_bytes=", self.packet_max_bytes,
+                "channels_per_packet=", channels_per_packet,
+                "total_packets=", len(packets),
+            )
+            self._printed_packetize_debug = True
+
         return packets, meta
 
     def _sample_message_loss(self, msg) -> Tuple[bool, Dict[str, Any]]:
@@ -328,10 +354,15 @@ class ChannelModel:
         feat = self._extract_world_feat(msg)
 
         if feat is None:
-            # Fallback for logits messages or unexpected payloads.
+            # If this is a logits late-fusion message, packetize logits instead
+            # of falling back to message-level loss.
+            heatmap, offset = self._extract_logits_payload(msg)
+            if heatmap is not None and offset is not None:
+                return self._apply_logits_packet_loss(msg)
+
+            # Fallback for unexpected payloads.
             lost, meta = self._sample_message_loss(msg)
             return (not lost), meta
-
         try:
             channel_dim, C, H, W = self._infer_feature_shape(feat)
         except ValueError:
@@ -487,3 +518,260 @@ class ChannelModel:
         meta.update(msg.meta)
 
         return True, msg.recv_slot, msg, meta
+
+    def _extract_logits_payload(self, msg):
+        """
+        For logits late fusion messages:
+            payload['world_heatmap']
+            payload['world_offset']
+        """
+        payload = getattr(msg, "payload", None)
+        if not isinstance(payload, dict):
+            return None, None
+
+        hm = payload.get("world_heatmap", None)
+        off = payload.get("world_offset", None)
+
+        if torch.is_tensor(hm) and torch.is_tensor(off):
+            return hm, off
+
+        return None, None
+
+    def _infer_logits_shape(self, heatmap: torch.Tensor, offset: torch.Tensor):
+        """
+        Return H, W, total_channels for logits payload.
+
+        Expected common shapes:
+            heatmap: [B, 1, H, W]
+            offset : [B, 2, H, W]
+
+        Also supports:
+            heatmap: [1, H, W]
+            offset : [2, H, W]
+        """
+
+        if heatmap.dim() == 4:
+            hm_c = int(heatmap.shape[1])
+            H = int(heatmap.shape[2])
+            W = int(heatmap.shape[3])
+        elif heatmap.dim() == 3:
+            hm_c = int(heatmap.shape[0])
+            H = int(heatmap.shape[1])
+            W = int(heatmap.shape[2])
+        elif heatmap.dim() == 2:
+            hm_c = 1
+            H = int(heatmap.shape[0])
+            W = int(heatmap.shape[1])
+        else:
+            raise ValueError(f"Unsupported heatmap shape: {tuple(heatmap.shape)}")
+
+        if offset.dim() == 4:
+            off_c = int(offset.shape[1])
+            off_H = int(offset.shape[2])
+            off_W = int(offset.shape[3])
+        elif offset.dim() == 3:
+            off_c = int(offset.shape[0])
+            off_H = int(offset.shape[1])
+            off_W = int(offset.shape[2])
+        else:
+            raise ValueError(f"Unsupported offset shape: {tuple(offset.shape)}")
+
+        if H != off_H or W != off_W:
+            raise ValueError(
+                f"heatmap and offset spatial size mismatch: "
+                f"heatmap=({H},{W}), offset=({off_H},{off_W})"
+            )
+
+        total_channels = hm_c + off_c
+        return H, W, total_channels
+
+    def _build_logits_spatial_packets(
+        self,
+        H: int,
+        W: int,
+        total_channels: int,
+        bits_per_value: int,
+    ):
+        """
+        Size-aware packetization for logits.
+
+        Each packet contains a contiguous row block of:
+            heatmap + offset
+
+        Packet size estimate:
+            rows * W * total_channels * bits_per_value / 8
+        """
+
+        bytes_per_row = float(W * total_channels * bits_per_value / 8.0)
+
+        if self.packetize_mode == "fixed":
+            # Reuse channel_group_size as rows_per_packet for logits fixed mode.
+            rows_per_packet = max(1, int(self.channel_group_size))
+        else:
+            if self.packet_max_bytes <= 0:
+                raise ValueError("packet_max_bytes must be positive when packetize_mode='size'.")
+
+            rows_per_packet = max(1, int(self.packet_max_bytes // bytes_per_row))
+
+        packets = []
+        for r0 in range(0, H, rows_per_packet):
+            r1 = min(r0 + rows_per_packet, H)
+            packets.append((r0, r1))
+
+        meta = {
+            "packetize_mode": self.packetize_mode,
+            "logits_packetize_axis": "spatial_rows",
+            "packet_max_bytes": self.packet_max_bytes,
+            "bytes_per_logits_row_est": bytes_per_row,
+            "rows_per_packet": rows_per_packet,
+            "total_packets": len(packets),
+            "logits_H": H,
+            "logits_W": W,
+            "logits_channels": total_channels,
+        }
+
+        if not hasattr(self, "_printed_logits_packetize_debug"):
+            print(
+                "[DEBUG logits packetize]",
+                "mode=", self.packetize_mode,
+                "H=", H,
+                "W=", W,
+                "total_channels=", total_channels,
+                "bits_per_value=", bits_per_value,
+                "bytes_per_row=", bytes_per_row,
+                "packet_max_bytes=", self.packet_max_bytes,
+                "rows_per_packet=", rows_per_packet,
+                "total_packets=", len(packets),
+            )
+            self._printed_logits_packetize_debug = True
+
+        return packets, meta
+
+    def _zero_logits_rows(
+        self,
+        heatmap: torch.Tensor,
+        offset: torch.Tensor,
+        r0: int,
+        r1: int,
+    ):
+        """
+        For max late fusion:
+        - lost heatmap rows are set to a very small value
+            so they will not win max fusion.
+        - lost offset rows are set to 0.
+        """
+
+        # heatmap
+        if heatmap.dim() == 4:
+            heatmap[:, :, r0:r1, :] = -1e4
+        elif heatmap.dim() == 3:
+            heatmap[:, r0:r1, :] = -1e4
+        elif heatmap.dim() == 2:
+            heatmap[r0:r1, :] = -1e4
+
+        # offset
+        if offset.dim() == 4:
+            offset[:, :, r0:r1, :] = 0
+        elif offset.dim() == 3:
+            offset[:, r0:r1, :] = 0
+
+
+    def _apply_logits_packet_loss(self, msg) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Packetize logits payload spatially.
+
+        payload:
+            world_heatmap
+            world_offset
+
+        A lost packet means the corresponding spatial rows of both
+        heatmap and offset are unavailable.
+        """
+
+        heatmap, offset = self._extract_logits_payload(msg)
+
+        if heatmap is None or offset is None:
+            lost, meta = self._sample_message_loss(msg)
+            return (not lost), meta
+
+        try:
+            H, W, total_channels = self._infer_logits_shape(heatmap, offset)
+        except ValueError:
+            lost, meta = self._sample_message_loss(msg)
+            return (not lost), meta
+
+        bits_per_value = int(msg.meta.get("quant_bits", self.bits_per_value))
+
+        packets, pkt_meta = self._build_logits_spatial_packets(
+            H=H,
+            W=W,
+            total_channels=total_channels,
+            bits_per_value=bits_per_value,
+        )
+
+        out_heatmap = heatmap.clone()
+        out_offset = offset.clone()
+
+        packet_mask: List[int] = []
+        packet_states: List[str] = []
+        packet_loss_probs: List[float] = []
+        lost_packets = 0
+
+        logits_valid_mask = torch.ones(
+            H,
+            W,
+            device=heatmap.device,
+            dtype=torch.bool,
+        )
+
+        for r0, r1 in packets:
+            lost, packet_meta = self._sample_packet_loss(msg)
+
+            packet_mask.append(0 if lost else 1)
+            packet_states.append(str(packet_meta.get("packet_state", "")))
+            packet_loss_probs.append(float(packet_meta.get("packet_loss_prob", 0.0)))
+
+            if not lost:
+                continue
+
+            lost_packets += 1
+            logits_valid_mask[r0:r1, :] = False
+
+            self._zero_logits_rows(
+                heatmap=out_heatmap,
+                offset=out_offset,
+                r0=r0,
+                r1=r1,
+            )
+
+        msg.payload["world_heatmap"] = out_heatmap
+        msg.payload["world_offset"] = out_offset
+        msg.payload["logits_valid_mask"] = logits_valid_mask
+
+        total_packets = len(packets)
+        packet_loss_rate = lost_packets / max(total_packets, 1)
+
+        ge_link_key = self._get_link_key(msg) if self.channel_model == "gilbert_elliott" else ""
+
+        meta = {
+            "channel_model": self.channel_model,
+            "loss_granularity": "channel",
+            "payload_type": "logits",
+            "lost_packets": lost_packets,
+            "total_packets": total_packets,
+            "packet_loss_rate": packet_loss_rate,
+            "packet_mask": packet_mask,
+            "packet_states": packet_states,
+            "packet_loss_probs": packet_loss_probs,
+            "ge_link": ge_link_key,
+            **pkt_meta,
+        }
+
+        msg.meta.update(meta)
+
+        if lost_packets == total_packets:
+            msg.dropped = True
+            msg.drop_reason = "all_logits_packets_lost"
+            return False, meta
+
+        return True, meta
